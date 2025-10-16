@@ -1,9 +1,9 @@
 import bisect
 import functools
 import os
+import warnings
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, NamedTuple, Optional
 
 import numpy as np
 
@@ -11,19 +11,13 @@ from faster_whisper.utils import get_assets_path
 
 
 # The code below is adapted from https://github.com/snakers4/silero-vad.
-@dataclass
-class VadOptions:
+class VadOptions(NamedTuple):
     """VAD options.
 
     Attributes:
       threshold: Speech threshold. Silero VAD outputs speech probabilities for each audio chunk,
         probabilities ABOVE this value are considered as SPEECH. It is better to tune this
         parameter for each dataset separately, but "lazy" 0.5 is pretty good for most datasets.
-      neg_threshold: Silence threshold for determining the end of speech. If a probability is lower
-        than neg_threshold, it is always considered silence. Values higher than neg_threshold
-        are only considered speech if the previous sample was classified as speech; otherwise,
-        they are treated as silence. This parameter helps refine the detection of speech
-         transitions, ensuring smoother segment boundaries.
       min_speech_duration_ms: Final speech chunks shorter min_speech_duration_ms are thrown out.
       max_speech_duration_s: Maximum duration of speech chunks in seconds. Chunks longer
         than max_speech_duration_s will be split at the timestamp of the last silence that
@@ -31,21 +25,23 @@ class VadOptions:
         split aggressively just before max_speech_duration_s.
       min_silence_duration_ms: In the end of each speech chunk wait for min_silence_duration_ms
         before separating it
+      window_size_samples: Audio chunks of window_size_samples size are fed to the silero VAD model.
+        WARNING! Silero VAD models were trained using 512, 1024, 1536 samples for 16000 sample rate.
+        Values other than these may affect model performance!!
       speech_pad_ms: Final speech chunks are padded by speech_pad_ms each side
     """
 
     threshold: float = 0.5
-    neg_threshold: float = None
-    min_speech_duration_ms: int = 0
+    min_speech_duration_ms: int = 250
     max_speech_duration_s: float = float("inf")
     min_silence_duration_ms: int = 2000
+    window_size_samples: int = 1024
     speech_pad_ms: int = 400
 
 
 def get_speech_timestamps(
     audio: np.ndarray,
     vad_options: Optional[VadOptions] = None,
-    sampling_rate: int = 16000,
     **kwargs,
 ) -> List[dict]:
     """This method is used for splitting long audios into speech chunks using silero VAD.
@@ -53,7 +49,6 @@ def get_speech_timestamps(
     Args:
       audio: One dimensional float array.
       vad_options: Options for VAD processing.
-      sampling rate: Sampling rate of the audio.
       kwargs: VAD options passed as keyword arguments for backward compatibility.
 
     Returns:
@@ -63,12 +58,19 @@ def get_speech_timestamps(
         vad_options = VadOptions(**kwargs)
 
     threshold = vad_options.threshold
-    neg_threshold = vad_options.neg_threshold
     min_speech_duration_ms = vad_options.min_speech_duration_ms
     max_speech_duration_s = vad_options.max_speech_duration_s
     min_silence_duration_ms = vad_options.min_silence_duration_ms
-    window_size_samples = 512
+    window_size_samples = vad_options.window_size_samples
     speech_pad_ms = vad_options.speech_pad_ms
+
+    if window_size_samples not in [512, 1024, 1536]:
+        warnings.warn(
+            "Unusual window_size_samples! Supported window_size_samples:\n"
+            " - [512, 1024, 1536] for 16000 sampling_rate"
+        )
+
+    sampling_rate = 16000
     min_speech_samples = sampling_rate * min_speech_duration_ms / 1000
     speech_pad_samples = sampling_rate * speech_pad_ms / 1000
     max_speech_samples = (
@@ -82,17 +84,20 @@ def get_speech_timestamps(
     audio_length_samples = len(audio)
 
     model = get_vad_model()
+    state = model.get_initial_state(batch_size=1)
 
-    padded_audio = np.pad(
-        audio, (0, window_size_samples - audio.shape[0] % window_size_samples)
-    )
-    speech_probs = model(padded_audio)
+    speech_probs = []
+    for current_start_sample in range(0, audio_length_samples, window_size_samples):
+        chunk = audio[current_start_sample : current_start_sample + window_size_samples]
+        if len(chunk) < window_size_samples:
+            chunk = np.pad(chunk, (0, int(window_size_samples - len(chunk))))
+        speech_prob, state = model(chunk, state, sampling_rate)
+        speech_probs.append(speech_prob)
 
     triggered = False
     speeches = []
     current_speech = {}
-    if neg_threshold is None:
-        neg_threshold = max(threshold - 0.15, 0.01)
+    neg_threshold = threshold - 0.15
 
     # to save potential segment end (and tolerate some silence)
     temp_end = 0
@@ -183,64 +188,12 @@ def get_speech_timestamps(
     return speeches
 
 
-def collect_chunks(
-    audio: np.ndarray,
-    chunks: List[dict],
-    sampling_rate: int = 16000,
-    max_duration: float = float("inf"),
-) -> Tuple[List[np.ndarray], List[Dict[str, float]]]:
-    """This function merges the chunks of audio into chunks of max_duration (s) length."""
+def collect_chunks(audio: np.ndarray, chunks: List[dict]) -> np.ndarray:
+    """Collects and concatenates audio chunks."""
     if not chunks:
-        chunk_metadata = {
-            "offset": 0,
-            "duration": 0,
-            "segments": [],
-        }
-        return [np.array([], dtype=np.float32)], [chunk_metadata]
+        return np.array([], dtype=np.float32)
 
-    audio_chunks = []
-    chunks_metadata = []
-
-    current_segments = []
-    current_duration = 0
-    total_duration = 0
-    current_audio = np.array([], dtype=np.float32)
-
-    for chunk in chunks:
-        if (
-            current_duration + chunk["end"] - chunk["start"]
-            > max_duration * sampling_rate
-        ):
-            audio_chunks.append(current_audio)
-            chunk_metadata = {
-                "offset": total_duration / sampling_rate,
-                "duration": current_duration / sampling_rate,
-                "segments": current_segments,
-            }
-            total_duration += current_duration
-            chunks_metadata.append(chunk_metadata)
-
-            current_segments = []
-
-            current_audio = audio[chunk["start"] : chunk["end"]]
-            current_duration = chunk["end"] - chunk["start"]
-        else:
-            current_segments.append(chunk)
-            current_audio = np.concatenate(
-                (current_audio, audio[chunk["start"] : chunk["end"]])
-            )
-
-            current_duration += chunk["end"] - chunk["start"]
-
-    audio_chunks.append(current_audio)
-
-    chunk_metadata = {
-        "offset": total_duration / sampling_rate,
-        "duration": current_duration / sampling_rate,
-        "segments": current_segments,
-    }
-    chunks_metadata.append(chunk_metadata)
-    return audio_chunks, chunks_metadata
+    return np.concatenate([audio[chunk["start"] : chunk["end"]] for chunk in chunks])
 
 
 class SpeechTimestampsMap:
@@ -266,19 +219,15 @@ class SpeechTimestampsMap:
         self,
         time: float,
         chunk_index: Optional[int] = None,
-        is_end: bool = False,
     ) -> float:
         if chunk_index is None:
-            chunk_index = self.get_chunk_index(time, is_end)
+            chunk_index = self.get_chunk_index(time)
 
         total_silence_before = self.total_silence_before[chunk_index]
         return round(total_silence_before + time, self.time_precision)
 
-    def get_chunk_index(self, time: float, is_end: bool = False) -> int:
+    def get_chunk_index(self, time: float) -> int:
         sample = int(time * self.sampling_rate)
-        if sample in self.chunk_end_sample and is_end:
-            return self.chunk_end_sample.index(sample)
-
         return min(
             bisect.bisect(self.chunk_end_sample, sample),
             len(self.chunk_end_sample) - 1,
@@ -288,7 +237,7 @@ class SpeechTimestampsMap:
 @functools.lru_cache
 def get_vad_model():
     """Returns the VAD model instance."""
-    path = os.path.join(get_assets_path(), "silero_vad_v6.onnx")
+    path = os.path.join(get_assets_path(), "silero_vad.onnx")
     return SileroVADModel(path)
 
 
@@ -304,7 +253,6 @@ class SileroVADModel:
         opts = onnxruntime.SessionOptions()
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 1
-        opts.enable_cpu_mem_arena = False
         opts.log_severity_level = 4
 
         self.session = onnxruntime.InferenceSession(
@@ -313,39 +261,31 @@ class SileroVADModel:
             sess_options=opts,
         )
 
-    def __call__(
-        self, audio: np.ndarray, num_samples: int = 512, context_size_samples: int = 64
-    ):
-        assert audio.ndim == 1, "Input should be a 1D array"
-        assert (
-            audio.shape[0] % num_samples == 0
-        ), "Input size should be a multiple of num_samples"
+    def get_initial_state(self, batch_size: int):
+        h = np.zeros((2, batch_size, 64), dtype=np.float32)
+        c = np.zeros((2, batch_size, 64), dtype=np.float32)
+        return h, c
 
-        h = np.zeros((1, 1, 128), dtype="float32")
-        c = np.zeros((1, 1, 128), dtype="float32")
-        context = np.zeros(
-            (1, context_size_samples),
-            dtype="float32",
-        )
-
-        batched_audio = audio.reshape(-1, num_samples)
-        context = batched_audio[..., -context_size_samples:]
-        context[-1] = 0
-        context = np.roll(context, 1, 0)
-        batched_audio = np.concatenate([context, batched_audio], 1)
-
-        batched_audio = batched_audio.reshape(-1, num_samples + context_size_samples)
-
-        encoder_batch_size = 10000
-        num_segments = batched_audio.shape[0]
-        outputs = []
-        for i in range(0, num_segments, encoder_batch_size):
-            output, h, c = self.session.run(
-                None,
-                {"input": batched_audio[i : i + encoder_batch_size], "h": h, "c": c},
+    def __call__(self, x, state, sr: int):
+        if len(x.shape) == 1:
+            x = np.expand_dims(x, 0)
+        if len(x.shape) > 2:
+            raise ValueError(
+                f"Too many dimensions for input audio chunk {len(x.shape)}"
             )
-            outputs.append(output)
+        if sr / x.shape[1] > 31.25:
+            raise ValueError("Input audio chunk is too short")
 
-        out = np.concatenate(outputs, axis=0)
+        h, c = state
 
-        return out
+        ort_inputs = {
+            "input": x,
+            "h": h,
+            "c": c,
+            "sr": np.array(sr, dtype="int64"),
+        }
+
+        out, h, c = self.session.run(None, ort_inputs)
+        state = (h, c)
+
+        return out, state
